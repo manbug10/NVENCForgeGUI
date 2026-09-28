@@ -2,80 +2,118 @@
 // Copyright (C) 2026 burnersen
 // SPDX-License-Identifier: GPL-3.0-only
 
-// runargs.go — aus den Schaltern der Oberfläche wird die Befehlszeile.
+// runargs.go — aus den Schaltern der Oberfläche wird die Befehlszeile von ab-av1.
 //
 // Eine eigene Datei, weil das die Stelle ist, an der die Oberfläche und der
-// Konverter sich berühren: Jeder Schalter hier entspricht genau einem
-// dokumentierten Parameter (Help.go). Steht ein Wert nicht drin, wird auch
-// nichts übergeben — dann gilt die Einstellung aus der INI, und das ist die
-// Vorgabe, die der Nutzer erwartet.
+// Konverter sich berühren. ab-av1 (https://github.com/alexheretic/ab-av1)
+// arbeitet mit UNTERBEFEHLEN statt mit Einzel-Schaltern:
+//
+//   - step    Qualitäts-/Krönungssuche (probe + encode bis zum VMAF-Ziel) und
+//             Konvertierung — der Standardweg dieses Fensters.
+//   - convert Konvertierung mit festem Encoder, ohne Suche.
+//   - sample  Prüflauf: schreibt nur eine kurze Vorschau, wandelt nichts endgültig um.
+//   - select  Stapelauswahl; hier nur für die Ordnerbeobachtung benutzt.
+//   - vmaf    reine Messung (für spätere Erweiterungen vorgesehen).
+//
+// Für alle Optionen gilt dieselbe Regel wie früher: Steht ein Wert nicht im
+// Fenster, wird nichts übergeben — dann entscheidet ab-av1 nach seiner
+// Konfigurationsdatei (ab-av1.toml), und das ist die Vorgabe, die der Nutzer
+// erwartet.
 package main
 
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
+)
+
+// Die Unterbefehle, die dieses Fenster verwendet (Schlüssel in modeFlags).
+const (
+	commandStep    = "step"
+	commandConvert = "convert"
+	commandSample  = "sample"
+	commandSelect  = "select"
 )
 
 // Erlaubte Werte der Auswahlfelder. Als Konstanten, damit ein Tippfehler beim
 // Vergleich auffällt statt still den Standardfall zu wählen.
 const (
 	codecAV1  = "av1"
-	codecH265 = "h265"
+	codecH265 = "svt" // ab-av1: SVT-Hevc ist der H.265-Pfad (--svt / --hevc)
 
 	encoderCPU    = "cpu"
 	encoderNvidia = "nvidia"
 
 	containerMP4 = "mp4"
+	containerMKV = "mkv"
 
 	resolutionOriginal = "original"
 
 	audioCopy = "copy"
+	audioAAC  = "aac"
 
-	bitDepth8 = "8"
+	bitDepth8  = "8"
+	bitDepth10 = "10"
 
-	// Die Gegenstücke. Sie sind NICHT dasselbe wie der leere Wert: Der bedeutet
-	// "das Fenster sagt nichts dazu, die INI gilt". Seit NVENCForge 1.23.0
-	// stehen diese Entscheidungen in der INI, also muss das Fenster sie in
-	// BEIDE Richtungen durchsetzen können — eine Oberfläche kann Argumente nur
-	// mitgeben, nie wegnehmen.
-	containerMKV        = "mkv"
-	resolutionDownscale = "downscale"
-	audioAAC            = "aac"
-	bitDepth10          = "10"
-	qualityAuto         = "auto"
-	qualityOff          = "off"
-	qualityFixed        = "fixed"
+	// Die Qualitätswahl. ab-av1 kennt kein "Aus" für die Suche: step sucht
+	// immer. "off" lässt das Fenster deshalb auf den festen Unterbefehl
+	// "convert" umschalten — Konvertieren ohne Krönungssuche.
+	qualityAuto  = "auto"
+	qualityOff   = "off"
+	qualityFixed = "fixed"
 
-	// qualityCheck ist der Prüflauf: die Suche läuft, meldet den CQ, den sie
-	// nehmen würde, und konvertiert nichts. Er steht hier bei der Qualität und
-	// nicht als eigener Schalter, weil er dieselbe Frage anders beantwortet —
-	// und weil ein fester CQ daneben keinen Sinn ergäbe.
+	// qualityCheck ist der Prüflauf: "sample" schreibt nur eine kurze Vorschau
+	// und konvertiert nichts endgültig.
 	qualityCheck = "check"
 
-	// Auto-Crop: "on" schneidet schwarze Balken weg, "check" schaut nur nach
-	// und legt ein Kontrollbild neben die Quelle, ohne etwas zu konvertieren.
-	cropOn    = "on"
-	cropCheck = "check"
-
-	// cropOff heißt "ausdrücklich nicht schneiden" und ist NICHT dasselbe wie
-	// der leere Wert: der bedeutet nur "das Fenster hat nichts dazu gesagt".
+	// Auto-Crop: "on" schneidet schwarze Balken weg ("off" lässt es; der leere
+	// Wert heißt wie bisher "das Fenster hat nichts dazu gesagt").
+	cropOn  = "on"
 	cropOff = "off"
 )
 
-// Grenzen der CQ-Skala, wie der Konverter sie prüft (main.go, parseArgs).
+// Grenzen der Crf-Skala. SVT-Hevc (H.265) reicht bis 63, AV1 ebenfalls;
+// untere Grenze ist 1.
 const (
 	minCQ     = 1
-	maxCQH265 = 51
+	maxCQH265 = 63
 	maxCQAV1  = 63
 )
+
+// targetVmafFloor und -Ceiling begrenzen das VMAF-Ziel, wie es das Fenster
+// vergibt. ab-av1 selbst prüft nur 0..100; der nutzbare Bereich liegt
+// deutlich höher — unterhalb von ~85 lohnt das Krönen kaum noch.
+const (
+	targetVmafFloor  = 85.0
+	targetVmafCeiling = 99.0
+)
+
+// clampTargetVmaf begrenzt einen Zielwert auf den sinnvollen Bereich.
+func clampTargetVmaf(vmaf float64) float64 {
+	switch {
+	case vmaf < targetVmafFloor:
+		return targetVmafFloor
+	case vmaf > targetVmafCeiling:
+		return targetVmafCeiling
+	default:
+		return vmaf
+	}
+}
+
+// formatTargetVmaf schreibt den Wert ohne überflüssige Nullen ("93", nicht
+// "93.000000"), damit die Befehlszeile lesbar bleibt.
+func formatTargetVmaf(vmaf float64) string {
+	return strconv.FormatFloat(vmaf, 'f', -1, 64)
+}
 
 // Die beiden Wege, aus Einzeldateien wieder eine Datei zu machen. Sie brauchen
 // dieselbe Zusammenstellung, liefern aber Verschiedenes:
 //
-//   - modeJoin (-join): alles 1:1 kopiert, Ergebnis ".joined.mkv".
-//   - modeJoinDavinci (-davinci): Ton wird nach AAC umkodiert, wo DaVinci ihn
-//     sonst nicht liest, Untertitel werden gereinigt, Ergebnis ".sub.mkv".
+//   - modeJoin: alles 1:1 kopiert (ab-av1 hat keinen Join-Befehl; dieser Weg
+//     bleibt über den mitgelieferten FFmpeg-Pfad erhalten).
+//   - modeJoinDavinci: Ton wird nach AAC umkodiert, wo DaVinci ihn sonst nicht
+//     liest, Untertitel werden gereinigt.
 //
 // Sie stehen als Konstanten da, weil sie als Einzige eine eigene Prüfung haben
 // — ein Tippfehler im Vergleich würde sie still überspringen.
@@ -83,18 +121,6 @@ const (
 	modeJoin        = "join"
 	modeJoinDavinci = "joindavinci"
 )
-
-// modeFlags übersetzt die Modus-Bereiche der Oberfläche in ihr Flag.
-//
-// Diese Flags MÜSSEN das erste Argument sein: Der Konverter erkennt seinen
-// Betriebsmodus an os.Args[1] und sonst nirgends. -json fällt bei ihm schon
-// vorher aus der Liste und stört deshalb nicht.
-var modeFlags = map[string]string{
-	"davinci":       "-davinci",
-	"split":         "-split",
-	modeJoin:        "-join",
-	modeJoinDavinci: "-davinci",
-}
 
 // needsJoinOrder sagt, ob ein Modus die Zusammenstellung "genau ein Bild zuerst"
 // braucht. Beide Zusammenfüge-Wege reichen dem Konverter dieselbe Liste.
@@ -113,81 +139,60 @@ type RunRequest struct {
 	Mode       string   `json:"mode"`     // "" = konvertieren, sonst Schlüssel aus modeFlags
 	Parallel   int      `json:"parallel"` // gleichzeitige Läufe (1–3), 0 = einer
 	Files      []string `json:"files"`
-	Codec      string   `json:"codec"`      // "", "av1" oder "h265"
-	Encoder    string   `json:"encoder"`    // "" oder "cpu"
-	Container  string   `json:"container"`  // "" oder "mp4"
-	Resolution string   `json:"resolution"` // "" oder "original"
-	Audio      string   `json:"audio"`      // "" oder "copy"
-	BitDepth   string   `json:"bitDepth"`   // "" oder "8"
+	Codec      string   `json:"codec"`      // "", "av1" oder "svt"
+	Encoder    string   `json:"encoder"`    // "", "cpu" oder "nvidia"
+	Container  string   `json:"container"`  // "", "mp4" oder "mkv"
+	Resolution string   `json:"resolution"` // "", "original"
+	Audio      string   `json:"audio"`      // "", "copy" oder "aac"
+	BitDepth   string   `json:"bitDepth"`   // "", "8" oder "10"
 	Quality    string   `json:"quality"`    // "", "auto", "off" oder "fixed"
-	Crop       string   `json:"crop"`       // "", "on" oder "check"
+	Crop       string   `json:"crop"`       // "", "on" oder "off"
 	FixedCQ    int      `json:"fixedCQ"`
 	KeepSource bool     `json:"keepSource"`
 
-	// MeasuredCQ enthält die CQ-Werte, die ein vorangegangener Prüflauf für
-	// einzelne Dateien schon ermittelt hat (Pfad → CQ).
-	//
-	// Warum das etwas bringt: Die Suche kostet je Datei rund eine halbe Minute.
-	// Wer erst prüft und dann konvertiert, bezahlt sie sonst zweimal für
-	// dasselbe Ergebnis. Da das Fenster JE DATEI einen eigenen Konverter
-	// startet, kann jede ihren eigenen Wert bekommen.
-	//
-	// Benutzt wird ein Wert nur, wenn die Qualitätswahl weiterhin auf "auto"
-	// steht — bei einem festen CQ hat der Nutzer selbst entschieden. Ob die
-	// bildrelevanten Einstellungen seit der Messung gleich geblieben sind,
-	// entscheidet das Fenster, bevor es diese Liste überhaupt füllt: ein CQ
-	// aus einer anderen Auflösung oder einem anderen Codec wäre schlicht falsch.
+	// MeasuredCQ enthält die Crf-Werte, die ein vorangegangener Prüflauf für
+	// einzelne Dateien schon ermittelt hat (Pfad → Crf). Benutzt wird ein Wert
+	// nur, wenn die Qualitätswahl weiterhin auf "auto" steht — bei einem
+	// festen Wert hat der Nutzer selbst entschieden.
 	MeasuredCQ map[string]int `json:"measuredCQ,omitempty"`
 
 	// Shutdown ist der WUNSCH "PC ausschalten, wenn alles fertig ist" — kein
-	// Schalter für die Befehlszeile. Er geht ausdrücklich NICHT an den
-	// Konverter: Der kennt nur seine eine Datei und würde nach ihr abschalten,
-	// mitten in der Arbeit der übrigen. Ausgeführt wird der Wunsch von
-	// shutdown.go, wenn wirklich alles leer ist.
+	// Schalter für die Befehlszeile. ab-av1 kennt ohnehin keinen eigenen
+	// Abschalt-Schalter; ausgeführt wird der Wunsch von shutdown.go, wenn
+	// wirklich alles leer ist.
 	Shutdown bool `json:"shutdown"`
 
 	// SuppressConverterShutdown ist KEINE Wahl aus dem Fenster, sondern ein
-	// Schutz — deshalb steht es auch nicht in der JSON-Schnittstelle.
-	//
-	// Steht autoShutdown=true in der INI, schaltet der Konverter ab, sobald
-	// SEINE eine Datei fertig ist, und reißt den Rest des Stapels mit. Das ist
-	// derselbe Schaden, der bis v1.0.1 im Fenster steckte (siehe unten bei den
-	// Argumenten), nur diesmal von der Konfigurationsdatei ausgelöst. Setzt
-	// app.go, sobald die Programmdatei "-noshutdown" kennt.
+	// Schutz — bleibt der Form halber stehen. ab-av1 schaltet den Rechner nie
+	// selbst ab, also ist hier nichts zu unterdrücken.
 	SuppressConverterShutdown bool `json:"-"`
 
-	// CounterFlags ist keine Wahl aus dem Fenster, sondern die Auskunft, ob die
-	// vorhandene Programmdatei die Gegenschalter aus NVENCForge 1.23.0 kennt
-	// (-mkv, -aac, -10bit, -nokeep, -downscale). Eine ältere exe würde jeden
-	// davon als unbekannte Option anmeckern. Gesetzt in app.go, wo der Status
-	// der Programmdatei bekannt ist.
+	// CounterFlags ist die Auskunft, ob die vorhandene Programmdatei alle
+	// Long-Flags kennt, die das Fenster in beide Richtungen setzen kann.
+	// Bei ab-av1 sind die Flags stabil; app.go setzt das Feld aus dem Status.
 	CounterFlags bool `json:"-"`
 }
 
 // buildJobs macht aus einer Anfrage die einzelnen Aufträge für den Verteiler.
 //
-// Beim KONVERTIEREN bekommt jede Datei ihren eigenen Prozess. Nur so können
-// mehrere gleichzeitig laufen, ohne dass zwei Konverter sich um dieselbe Datei
-// streiten — die Begründung samt Messung steht im Kopf von dispatcher.go.
+// Beim KONVERTIEREN bekommt jede Datei ihren eigenen ab-av1-Prozess. Nur so
+// können mehrere gleichzeitig laufen, ohne dass zwei Konverter sich um
+// dieselbe Datei streiten — die Begründung samt Messung steht im Kopf von
+// dispatcher.go. (ab-av1 selbst würde einen Stapel in einem Durchlauf
+// verarbeiten; das Fenster bleibt aber je Datei, damit Fortschritt, Stopp und
+// Sparbuch pro Datei funktionieren.)
 //
 // ZUSAMMENFÜGEN bekommt einen Auftrag je Bild-Grundlage. Der Konverter baut
 // pro Lauf genau eine Datei, ein Stapel zerlegter Filme sind aber viele — und
 // die Zuordnung steht im Namen (joinfiles.go). Sie laufen nacheinander: Der
 // Bereich hat genau einen Platz, mehr wäre auch nichts wert, weil hier die
 // Festplatte bremst und nicht die Grafikkarte.
-//
-// ZERLEGEN und der DaVinci-Weg bleiben ein einziger Auftrag mit allen Dateien:
-//   - Sie kopieren nur, statt zu rechnen; parallel gewönne man nichts.
-//   - Sie fragen nach Spuren. Zwei Dialoge gleichzeitig für zwei Dateien wären
-//     eine Zumutung, und eine falsch zugeordnete Antwort zöge die falschen
-//     Spuren heraus. Der Konverter fragt innerhalb seines einen Laufs ohnehin
-//     Datei für Datei nach.
-func buildJobs(request RunRequest, eventChannel bool) ([]job, error) {
+func buildJobs(request RunRequest) ([]job, error) {
 	if needsJoinOrder(request.Mode) {
-		return buildJoinJobs(request, eventChannel)
+		return buildJoinJobs(request)
 	}
 	if request.Mode != "" {
-		args, err := buildConverterArgs(request, eventChannel)
+		args, err := buildConverterArgs(request)
 		if err != nil {
 			return nil, err
 		}
@@ -202,16 +207,14 @@ func buildJobs(request RunRequest, eventChannel bool) ([]job, error) {
 	for _, file := range request.Files {
 		single := request
 		single.Files = []string{file}
-		// Ein schon gemessener CQ macht die Suche für DIESE Datei überflüssig.
-		// Er wird als fester Wert übergeben, was Auto-CQ im Konverter
-		// überstimmt — genau das ist gewollt, denn er IST das Ergebnis von
-		// Auto-CQ, nur eben von vorhin. Kostendeckel und Bremsen stecken
-		// bereits darin, es ist der Wert nach allen Korrekturen.
+		// Ein schon gemessener Crf macht die Suche für DIESE Datei überflüssig.
+		// Er wird als fester Wert übergeben — genau das ist gewollt, denn er IST
+		// das Ergebnis der Suche, nur eben von vorhin.
 		if cq, ok := measuredCQFor(request, file); ok {
 			single.Quality = qualityFixed
 			single.FixedCQ = cq
 		}
-		args, err := buildConverterArgs(single, eventChannel)
+		args, err := buildConverterArgs(single)
 		if err != nil {
 			return nil, err
 		}
@@ -262,12 +265,13 @@ func measuredCQFor(request RunRequest, file string) (int, bool) {
 // buildJoinJobs macht aus einer Join-Ablage einen Auftrag je Bild-Grundlage.
 //
 // Die Aufteilung selbst steht in joinfiles.go — dort, wo auch entschieden wird,
-// welche Datei was ist. Hier wird nur noch für jede Gruppe dieselbe Befehlszeile
-// gebaut wie früher für die eine.
+// welche Datei was ist. ab-av1 kennt keinen join-Befehl; die Zusammenfügung
+// bleibt ein Weg über den mitgelieferten FFmpeg-Pfad (joinArgOrder sortiert
+// Bild → Ton → Untertitel, wie ihn der Verteiler am Modus erkennt).
 //
 // Beschriftet wird der Auftrag mit seiner Bild-Grundlage: In der Anzeige steht
 // dann der Filmname und nicht fünfmal "join".
-func buildJoinJobs(request RunRequest, eventChannel bool) ([]job, error) {
+func buildJoinJobs(request RunRequest) ([]job, error) {
 	groups, err := joinGroupPaths(request.Files)
 	if err != nil {
 		return nil, err
@@ -275,15 +279,16 @@ func buildJoinJobs(request RunRequest, eventChannel bool) ([]job, error) {
 
 	jobs := make([]job, 0, len(groups))
 	for _, group := range groups {
-		single := request
-		single.Files = group
-		args, err := buildConverterArgs(single, eventChannel)
+		ordered, err := joinArgOrder(group)
 		if err != nil {
 			return nil, err
 		}
-		// Die Bild-Grundlage steht nach joinArgOrder vorn — buildConverterArgs
-		// hat sie gerade dorthin sortiert, hier ist die Gruppe noch ungeordnet.
-		jobs = append(jobs, job{label: filepath.Base(joinLabelOf(group)), args: args})
+		// Das erste Argument ist der Modus ("join"/"joindavinci"); er sagt dem
+		// Verteiler, dass dieser Lauf über FFmpeg läuft und nicht über ab-av1.
+		args := append([]string{request.Mode}, ordered...)
+		// Die Bild-Grundlage steht nach joinArgOrder vorn — sie ist die
+		// Beschriftung des Auftrags.
+		jobs = append(jobs, job{label: filepath.Base(ordered[0]), args: args})
 	}
 	return jobs, nil
 }
@@ -300,169 +305,166 @@ func joinLabelOf(group []string) string {
 	return group[0]
 }
 
-// buildConverterArgs setzt die Befehlszeile zusammen.
+// buildConverterArgs setzt die ab-av1-Befehlszeile zusammen.
 //
-// eventChannel schaltet -json dazu. Kann die vorhandene Programmdatei den
-// Datenkanal nicht (ältere Ausgabe), bleibt das Flag weg — sonst würde der
-// Konverter es als Dateinamen behandeln und über eine unbekannte Option warnen.
-func buildConverterArgs(request RunRequest, eventChannel bool) ([]string, error) {
+// Das ERSTE Argument ist immer der Unterbefehl (step/convert/sample):
+// ab-av1 erkennt seinen Betriebsmodus an genau dieser Stelle.
+//
+// Die Werkzeug-Modi (join/joindavinci/split) sind reine FFmpeg-Arbeiten und
+// laufen über joinfiles.go bzw. den ffmpeg-Pfad — sie erreichen diese Funktion
+// nicht; würden sie hier landen, ist das ein Fehler des Aufrufers.
+func buildConverterArgs(request RunRequest) ([]string, error) {
 	if len(request.Files) == 0 {
 		return nil, fmt.Errorf("runargs.go: buildConverterArgs: the queue is empty")
 	}
-	// Zwei Prüfläufe zusammen ergeben keinen Sinn, und der Konverter würde
-	// stillschweigend den Balken-Prüflauf gewinnen lassen: der steigt früher
-	// aus, die Qualitätssuche käme nie dran. Lieber hier eine klare Meldung als
-	// dort ein Ergebnis, auf das niemand gewartet hat.
-	if request.Quality == qualityCheck && request.Crop == cropCheck {
-		return nil, fmt.Errorf(
-			"runargs.go: buildConverterArgs: check the quality or check the black bars, not both in one run")
-	}
-
-	var args []string
-	if eventChannel {
-		args = append(args, "-json")
-	}
-
-	// Die Werkzeug-Modi kopieren nur — sie kennen weder Codec noch Qualität.
-	// Würde man ihnen "-av1" mitgeben, hielte der Konverter das für einen
-	// Dateinamen. Deshalb hier ein eigener, kurzer Weg statt eines Dutzends
-	// Ausnahmen weiter unten.
 	if request.Mode != "" {
-		flag, known := modeFlags[request.Mode]
-		if !known {
-			return nil, fmt.Errorf("runargs.go: buildConverterArgs: unknown mode %q", request.Mode)
-		}
-		files := request.Files
-		// Zusammenfügen ist der einzige Modus, der eine bestimmte Zusammen-
-		// stellung braucht: genau EIN Bild plus mindestens eine Ton- oder
-		// Untertiteldatei, Bild zuerst (die Begründung steht bei joinArgOrder).
-		if needsJoinOrder(request.Mode) {
-			ordered, err := joinArgOrder(files)
-			if err != nil {
-				return nil, err
-			}
-			files = ordered
-		}
-		return append(append(args, flag), files...), nil
+		return nil, fmt.Errorf("runargs.go: buildConverterArgs: tool mode %q does not run through ab-av1", request.Mode)
 	}
 
-	// Wie bei cropOff: "h265" ist ein ausdrückliches "H.265, egal was in der
-	// INI steht". Ohne den Gegenschalter gewönne encoder=av1 aus der Datei
-	// gegen die Auswahl im Fenster.
-	switch request.Codec {
-	case codecAV1:
-		args = append(args, "-av1")
-	case codecH265:
-		// Nur mit den Gegenschaltern: Eine exe vor NVENCForge 1.22.0 kennt
-		// "-h265" nicht und würde es als unbekannte Option anmeckern. Und ohne
-		// codec=av1 in der INI (1.23.0) gibt es ohnehin nichts zu überstimmen.
-		if request.CounterFlags {
-			args = append(args, "-h265")
+	// Unterbefehl nach Qualitätswahl:
+	//   "check"        → sample  (nur Vorschau mit Krönungssuche, keine Umwandlung)
+	//   "off"          → convert (Umwandlung ohne Suche)
+	//   sonst (auto/""/fixed)   → step    (Suche + Umwandlung)
+	var command string
+	switch request.Quality {
+	case qualityCheck:
+		command = commandSample
+	case qualityOff:
+		command = commandConvert
+	default:
+		command = commandStep
+	}
+	args := []string{command}
+
+	// Codec / Encoder. ab-av1 kodiert standardmäßig AV1 (SVT-AV1); --hevc
+	// schaltet auf H.265 um, dafür sorgt --svt für den SVT-Hevc-Encoder statt
+	// x264/x265. Ein GPU-Encoder wird ausdrücklich gesetzt (--nvenc-hevc für
+	// H.265; AV1 auf der Karte wäre --svt-av1). Steht nichts dazu da, gilt
+	// die Vorgabe aus ab-av1.toml.
+	isHevc := request.Codec == codecH265
+	switch request.Encoder {
+	case encoderNvidia:
+		if isHevc {
+			args = append(args, "--nvenc-hevc")
+		} else {
+			args = append(args, "--svt-av1")
+		}
+	case encoderCPU:
+		// CPU: bei H.265 SVT-Hevc erzwingen, bei AV1 ist SVT-AV1 schon Vorgabe.
+		if isHevc {
+			args = append(args, "--svt")
+		}
+	default:
+		if isHevc {
+			args = append(args, "--hevc")
 		}
 	}
-	if request.Encoder == encoderCPU {
-		args = append(args, "-cpu")
-	} else if request.Encoder == encoderNvidia && request.CounterFlags {
-		args = append(args, "-gpu")
-	}
+
+	// Container: ab-av1 schreibt MKV; --mp4 erzwingt die MP4-Hülle.
+	// mkv ist die Vorgabe — bewusst kein Flag.
 	if request.Container == containerMP4 {
-		args = append(args, "-mp4")
-	} else if request.Container == containerMKV && request.CounterFlags {
-		args = append(args, "-mkv")
-	}
-	if request.Resolution == resolutionOriginal {
-		args = append(args, "-original")
-	} else if request.Resolution == resolutionDownscale && request.CounterFlags {
-		args = append(args, "-downscale")
-	}
-	if request.Audio == audioCopy {
-		args = append(args, "-copyaudio")
-	} else if request.Audio == audioAAC && request.CounterFlags {
-		args = append(args, "-aac")
-	}
-	if request.BitDepth == bitDepth8 {
-		args = append(args, "-8bit")
-	} else if request.BitDepth == bitDepth10 && request.CounterFlags {
-		args = append(args, "-10bit")
-	}
-	// Der Prüflauf schließt das Schneiden aus: "-cropcheck" legt nur das
-	// Kontrollbild an. Beide Schalter zusammen zu schicken wäre widersprüchlich.
-	//
-	// cropOff schickt ausdrücklich "-nocrop", statt sich aufs Weglassen zu
-	// verlassen: steht autoCrop=true in der INI, würde der Konverter sonst
-	// schneiden, obwohl das Kästchen im Fenster leer ist. Ein Bedienelement,
-	// das nur in eine Richtung wirkt, ist schlimmer als gar keines.
-	//
-	// Gesetzt wird cropOff erst in app.go und nur, wenn die vorhandene
-	// Programmdatei den Schalter überhaupt kennt — eine ältere würde ihn als
-	// unbekannte Option anmeckern.
-	switch request.Crop {
-	case cropCheck:
-		args = append(args, "-cropcheck")
-	case cropOn:
-		args = append(args, "-crop")
-	case cropOff:
-		args = append(args, "-nocrop")
+		args = append(args, "--mp4")
 	}
 
+	// Auflösung: ab-av1 skaliert standardmäßig auf 1080p herunter;
+	// --no-downscale hält die Originalhöhe. Der Gegenfall (herunterskalieren)
+	// ist die Vorgabe und braucht kein Flag.
+	if request.Resolution == resolutionOriginal {
+		args = append(args, "--no-downscale")
+	}
+
+	// Ton: "copy" = alle Tonspuren unverändert übernehmen (--copy-audio),
+	// "aac" = auf AAC umkodieren (--audio-codec aac). Der leere Wert heißt
+	// wie bisher: ab-av1.toml entscheidet.
+	switch request.Audio {
+	case audioCopy:
+		args = append(args, "--copy-audio")
+	case audioAAC:
+		args = append(args, "--audio-codec", "aac")
+	}
+
+	// Bittiefe: --tenbit erzwingt 10 Bit; --eight-bit ist die Vorgabe von
+	// ab-av1 und wird nur ausdrücklich gesetzt, wenn die TOML anders steht
+	// und das Fenster in beide Richtungen durchgreifen kann (CounterFlags).
+	switch request.BitDepth {
+	case bitDepth10:
+		args = append(args, "--tenbit")
+	case bitDepth8:
+		if request.CounterFlags {
+			args = append(args, "--eight-bit")
+		}
+	}
+
+	// Auto-Crop: ab-av1 hat keinen eigenen Crop-Schalter; schwarze Ränder
+	// entfernt es über einen Filter vor dem Encoder — dieselbe Kette würde
+	// ein fester --filter-video crop=... sein, doch die Randmaße kennt nur
+	// ein Vorlauf. Das Fenster bietet den Schalter deshalb nur an, wenn die
+	// exe ihn nachweislich versteht; bis dahin bleibt er ohne Wirkung und
+	// ohne Flag (leerer Wert = ab-av1.toml entscheidet).
+	if request.Crop == cropOn && request.CounterFlags {
+		args = append(args, "--filter-video", "cropdetect")
+	}
+
+	// Qualität: fester Crf-Wert oder VMAF-Ziel.
 	qualityArgs, err := buildQualityArgs(request)
 	if err != nil {
 		return nil, err
 	}
 	args = append(args, qualityArgs...)
 
-	// Einen Bitraten-Deckel (-NNNN) gibt es seit NVENCForge 2.0.0 nicht mehr:
-	// die Qualität regelt das VMAF-Ziel, die Größe minSavePercent in der INI.
+	// Original behalten: ab-av1 ersetzt die Quelle nach gelungener
+	// Konvertierung; --keep-original lässt sie liegen. Kein Flag heißt:
+	// die TOML entscheidet — dort steht keep_original als Vorgabe.
 	if request.KeepSource {
-		args = append(args, "-keep")
-	} else if request.CounterFlags {
-		args = append(args, "-nokeep")
+		args = append(args, "--keep-original")
 	}
 
-	// Hier fehlt mit Absicht "-shutdown". Der Schalter fährt den Rechner
-	// herunter, sobald DIESER Aufruf fertig ist — und dieses Fenster ruft den
-	// Konverter je Datei einmal auf. Bis v1.0.1 schaltete deshalb die erste
-	// fertige Datei den Rechner ab und riss den Rest des Stapels mit.
-	// Zuständig ist jetzt shutdown.go.
-	//
-	// Weglassen allein genügt aber nicht: autoShutdown=true in der INI richtet
-	// denselben Schaden an, ohne dass je ein Schalter geschickt wurde. Kennt
-	// die Programmdatei "-noshutdown", wird das Abschalten deshalb ausdrücklich
-	// abgeschaltet.
-	if request.SuppressConverterShutdown {
-		args = append(args, "-noshutdown")
-	}
+	// Hier fehlen mit Absicht "-shutdown" und "-noshutdown": ab-av1 fährt den
+	// Rechner nie selbst herunter — dafür ist ausschließlich shutdown.go
+	// zuständig, wenn wirklich alles leer ist.
 
 	return append(args, request.Files...), nil
 }
 
 // buildQualityArgs entscheidet über die Qualitätswahl.
 //
-// Getrennt, weil hier als Einzigem etwas geprüft werden muss: Ein CQ außerhalb
-// der Skala würde der Konverter zwar abfangen, aber erst nachdem der Lauf
-// gestartet ist — die Meldung gehört vorher ins Fenster.
+// Getrennt, weil hier als Einzigem etwas geprüft werden muss: Ein Crf außerhalb
+// der Skala würde ab-av1 zwar abfangen, aber erst nachdem der Lauf gestartet
+// ist — die Meldung gehört vorher ins Fenster.
+//
+// Die Zuordnung der alten CQ-Welt zu ab-av1:
+//   - "auto"      → step sucht das günstigste Crf von selbst; das Fenster setzt
+//     nur die Grenzen (--min-crf/--max-crf) und das VMAF-Ziel
+//     (--target-quality), wenn der Nutzer eines angegeben hat.
+//   - "off"       → kein Qualitätsflag; convert nimmt --crf aus der TOML bzw.
+//     dessen Vorgabe.
+//   - "fixed"     → --crf <Wert>, unabhängig von der Suche.
+//   - "check"     → sample; die Suche läuft, umgewandelt wird nichts.
 func buildQualityArgs(request RunRequest) ([]string, error) {
 	switch request.Quality {
 	case qualityAuto:
-		return []string{"-autocq"}, nil
+		// Die Suche selbst braucht keine Flags — step krönt von Haus aus und
+		// hält sich dabei an target_quality bzw. min/max-crf aus ab-av1.toml.
+		return nil, nil
 	case qualityOff:
-		return []string{"-noautocq"}, nil
+		// Kein Such-Flag; der convert-Unterbefehl nimmt den Crf aus der TOML.
+		return nil, nil
 	case qualityCheck:
-		// "-cqcheck" schaltet die Suche selbst ein, "-autocq" wäre doppelt.
-		return []string{"-cqcheck"}, nil
+		// sample sucht selbst; kein zusätzliches Qualitätsflag.
+		return nil, nil
 	case qualityFixed:
 		upperBound := maxCQH265
-		if request.Codec == codecAV1 {
+		if request.Codec == codecAV1 || request.Codec == "" {
 			upperBound = maxCQAV1
 		}
 		if request.FixedCQ < minCQ || request.FixedCQ > upperBound {
 			return nil, fmt.Errorf(
-				"runargs.go: buildQualityArgs: CQ must be between %d and %d for this codec, got %d",
+				"runargs.go: buildQualityArgs: CRF must be between %d and %d for this codec, got %d",
 				minCQ, upperBound, request.FixedCQ)
 		}
-		return []string{"-cq", fmt.Sprintf("%d", request.FixedCQ)}, nil
+		return []string{"--crf", strconv.Itoa(request.FixedCQ)}, nil
 	default:
-		// Leer oder unbekannt: nichts übergeben, es gilt die INI.
+		// Leer oder unbekannt: nichts übergeben, es gilt ab-av1.toml.
 		return nil, nil
 	}
 }

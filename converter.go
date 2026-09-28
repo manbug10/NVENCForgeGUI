@@ -11,6 +11,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -24,48 +25,54 @@ import (
 )
 
 const (
-	converterExeName = "NVENCForge.exe"
-	toolsDirName     = "tools"
+	// converterExeName: ab-av1 kommt als Archiv ("ab-av1-windows-x86_64.zip"),
+	// in dem die ausführbare Datei nur "ab-av1.exe" heißt. locateConverter und
+	// der Download suchen beide nach diesem Namen im tools-Ordner.
+	converterExeName = "ab-av1.exe"
+	// converterAssetName ist der Name der angehängten Datei im GitHub-Release
+	// von alexheretic/ab-av1. downloadConverter lädt genau dieses Asset und
+	// packt daraus ab-av1.exe aus (siehe unzipSingleFile).
+	converterAssetName = "ab-av1-windows-x86_64.zip"
+	toolsDirName       = "tools"
 
 	// versionFileName merkt sich, welche Ausgabe geladen wurde. Die exe selbst
 	// nach ihrer Version zu fragen hieße, sie zu starten — dafür ist eine reine
 	// Anzeige kein guter Grund.
-	versionFileName = "NVENCForge.version"
+	versionFileName = "ab-av1.version"
 
 	// latestReleaseURL liefert die zuletzt veröffentlichte Ausgabe.
-	latestReleaseURL = "https://api.github.com/repos/burnersen/NVENCForge/releases/latest"
+	latestReleaseURL = "https://api.github.com/repos/alexheretic/ab-av1/releases/latest"
 
-	// jsonFlagMarker steht als Zeichenkette in jeder exe, die den Datenkanal
-	// kennt (consumeJSONFlag vergleicht genau darauf). Danach in der Datei zu
-	// suchen ist der billigste ehrliche Weg, die Fähigkeit festzustellen, ohne
-	// das Programm zu starten.
-	jsonFlagMarker = "-json"
+	// ---- Fähigkeits-Marker (ab-av1) -------------------------------------
+	//
+	// Wie bisher wird die Fähigkeit aus der Binary selbst gelesen, ohne sie
+	// zu starten. ab-av1 baut seine Befehle mit clap; die Long-Flags stehen
+	// als Klartext in der exe. Weil alle Releases dieselbe CLI besitzen,
+	// schlagen die Prüfungen bei jedem offiziellen Build an.
 
-	// cropFlagMarker zeigt an, dass die exe Auto-Crop kennt (ab NVENCForge
-	// 1.21.0). Geprüft wird auf "-cropcheck", nicht auf "-crop": das kürzere
-	// Wort steckt im längeren, und beide Schalter kamen zusammen dazu.
-	// Ohne diese Prüfung böte das Fenster Knöpfe an, die eine ältere exe
-	// kommentarlos als unbekannte Option verwirft.
-	cropFlagMarker = "-cropcheck"
+	// stepCommandMarker zeigt an, dass die exe den Befehl "step" kennt — den
+	// eigentlichen Encoder-Durchlauf von ab-av1 (VMAF-Suche + Konvertierung).
+	stepCommandMarker = "step"
 
-	// guardFlagMarker zeigt an, dass die exe die Gegenschalter kennt (ab
-	// NVENCForge 1.22.0): "-noshutdown" und "-h265". Ohne sie kann das Fenster
-	// nicht durchsetzen, was der Nutzer sieht — die INI gewönne immer.
-	// Geprüft wird an "-noshutdown", weil "-h265" auch in Fließtexten vorkommt.
-	guardFlagMarker = "-noshutdown"
+	// sampleCommandMarker zeigt an, dass die exe den Befehl "sample" kennt:
+	// der Vorschau-/Prüflauf, der nur misst und nichts endgültig umwandelt.
+	sampleCommandMarker = "sample"
 
-	// baseSettingsMarker zeigt an, dass die exe die Grundeinstellungen aus der
-	// INI kennt (ab NVENCForge 1.23.0) und dazu die Gegenschalter -mkv, -aac,
-	// -10bit, -nokeep und -downscale. Geprüft wird an "-downscale": das Wort
-	// kommt in keinem anderen Schalter und in keinem Hilfetext als Teilwort vor.
-	baseSettingsMarker = "-downscale"
+	// selectCommandMarker zeigt an, dass die exe den Befehl "select" kennt:
+	// die Stapel-Auswahl nach Quelle/Filter.
+	selectCommandMarker = "select"
 
-	// cqCheckFlagMarker zeigt an, dass die exe den Prüflauf der Qualitätssuche
-	// kennt (ab NVENCForge 1.30.0) und dazu das Ereignis "cq" schickt, aus dem
-	// die Liste ihren Wert nimmt. Beides kam zusammen dazu, also reicht ein
-	// Marker. Geprüft wird am Schalter, nicht am Ereignisnamen: "cq" allein
-	// steckt in zu vielen Wörtern.
-	cqCheckFlagMarker = "-cqcheck"
+	// convertCommandMarker zeigt an, dass die exe den Befehl "convert" kennt
+	// (Konvertierung ohne VMAF-Suche, fester Encoder).
+	convertCommandMarker = "convert"
+
+	// vmafResolutionsMarker zeigt an, dass die exe --vmaf-resolutions kennt
+	// (ab 0.7.0): Auflösungsfenster für die VMAF-Berechnung.
+	vmafResolutionsMarker = "--vmaf-resolutions"
+
+	// audioMarkerFlag zeigt an, dass die exe --audio-marker-map kennt (ab
+	// 0.7.1): Wasserzeichen-Erkennung im Ton.
+	audioMarkerFlag = "--audio-marker-map"
 
 	downloadTimeout = 10 * time.Minute
 	apiTimeout      = 30 * time.Second
@@ -73,18 +80,19 @@ const (
 
 // ConverterStatus ist alles, was die Oberfläche über die Programmdatei weiß.
 type ConverterStatus struct {
-	Found         bool   `json:"found"`
-	Path          string `json:"path"`
-	SizeBytes     int64  `json:"sizeBytes"`
-	Version       string `json:"version"`
-	EventChannel  bool   `json:"eventChannel"`
-	AutoCrop      bool   `json:"autoCrop"`
-	GuardFlags    bool   `json:"guardFlags"`
-	BaseSettings  bool   `json:"baseSettings"`
-	CQCheck       bool   `json:"cqCheck"`
-	ToolsDir      string `json:"toolsDir"`
-	FFmpegPresent bool   `json:"ffmpegPresent"`
-	Note          string `json:"note"`
+	Found          bool   `json:"found"`
+	Path           string `json:"path"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	Version        string `json:"version"`
+	HasStep        bool   `json:"hasStep"`
+	HasSample      bool   `json:"hasSample"`
+	HasSelect      bool   `json:"hasSelect"`
+	HasConvert     bool   `json:"hasConvert"`
+	HasVmafResol   bool   `json:"hasVmafResolutions"`
+	HasAudioMarker bool   `json:"hasAudioMarkerMap"`
+	ToolsDir       string `json:"toolsDir"`
+	FFmpegPresent  bool   `json:"ffmpegPresent"`
+	Note           string `json:"note"`
 }
 
 // toolsDirCandidates nennt die Orte, an denen die Programmdatei liegen kann.
@@ -144,7 +152,7 @@ func converterStatus() ConverterStatus {
 
 	path, found := locateConverter()
 	if !found {
-		status.Note = "NVENCForge.exe is not here yet — it can be downloaded from GitHub."
+		status.Note = "ab-av1.exe is not here yet — it can be downloaded from GitHub."
 		return status
 	}
 
@@ -155,37 +163,37 @@ func converterStatus() ConverterStatus {
 		status.SizeBytes = info.Size()
 	}
 	status.Version = readVersionFile(filepath.Dir(path))
+	// FFmpeg/ffprobe liegen bei ab-av1 neben der exe oder im PATH; die
+	// Erstausstattung (setup.go) lädt sie wie bisher herunter.
 	status.FFmpegPresent = fileExists(filepath.Join(filepath.Dir(path), "ffmpeg.exe"))
 
-	hasChannel, err := fileContainsMarker(path, jsonFlagMarker)
+	// Fähigkeitsprüfung: Befehle und Flags direkt aus der Binary lesen, ohne
+	// sie zu starten. Ein Lesefehler zählt als "kann es nicht": lieber einen
+	// Knopf zu wenig als einen, der nichts tut.
+	hasStep, err := fileContainsMarker(path, stepCommandMarker)
 	switch {
 	case err != nil:
-		status.Note = "Could not read NVENCForge.exe: " + err.Error()
-	case hasChannel:
-		status.EventChannel = true
+		status.Note = "Could not read ab-av1.exe: " + err.Error()
+	case hasStep:
+		status.HasStep = true
 	default:
-		status.Note = "This NVENCForge.exe has no event channel (-json). " +
+		status.Note = "This ab-av1.exe does not provide the 'step' command. " +
 			"The run still works, but progress can only be read from the log."
 	}
-
-	// Auto-Crop wird nur angeboten, wenn die exe es auch kann. Ein Lesefehler
-	// zählt hier als "kann es nicht": lieber einen Knopf zu wenig als einen,
-	// der nichts tut. Gemeldet wird er nicht noch einmal — der Fehler steht
-	// dann schon oben.
-	if hasCrop, cropErr := fileContainsMarker(path, cropFlagMarker); cropErr == nil && hasCrop {
-		status.AutoCrop = true
+	if hasSample, e := fileContainsMarker(path, sampleCommandMarker); e == nil && hasSample {
+		status.HasSample = true
 	}
-	// Dieselbe Vorsicht wie oben: kennt die Programmdatei die Gegenschalter
-	// nicht, werden sie auch nicht mitgeschickt — sie landeten sonst als
-	// unbekannte Optionen im Protokoll.
-	if hasGuards, guardErr := fileContainsMarker(path, guardFlagMarker); guardErr == nil && hasGuards {
-		status.GuardFlags = true
+	if hasSelect, e := fileContainsMarker(path, selectCommandMarker); e == nil && hasSelect {
+		status.HasSelect = true
 	}
-	if hasBase, baseErr := fileContainsMarker(path, baseSettingsMarker); baseErr == nil && hasBase {
-		status.BaseSettings = true
+	if hasConvert, e := fileContainsMarker(path, convertCommandMarker); e == nil && hasConvert {
+		status.HasConvert = true
 	}
-	if hasCQCheck, cqErr := fileContainsMarker(path, cqCheckFlagMarker); cqErr == nil && hasCQCheck {
-		status.CQCheck = true
+	if hasVmafRes, e := fileContainsMarker(path, vmafResolutionsMarker); e == nil && hasVmafRes {
+		status.HasVmafResol = true
+	}
+	if hasAudioMarker, e := fileContainsMarker(path, audioMarkerFlag); e == nil && hasAudioMarker {
+		status.HasAudioMarker = true
 	}
 	return status
 }
@@ -314,9 +322,51 @@ func callContext(ctx context.Context) context.Context {
 	return ctx
 }
 
-// pickConverterAsset sucht die Programmdatei unter den angehängten Dateien.
+// pickConverterAsset sucht das Windows-Archiv von ab-av1 unter den angehängten
+// Dateien des Releases. Aus ihm wird nach dem Download ab-av1.exe ausgepackt
+// (siehe unzipSingleFile).
 func pickConverterAsset(release releaseInfo) (releaseAsset, error) {
-	return pickAsset(release, converterExeName)
+	return pickAsset(release, converterAssetName)
+}
+
+// unzipSingleFile packt genau eine Datei aus einem ZIP-Archiv an den
+// Zielort. ab-av1 liefert seine exe im Zip; die übrigen Einträge des Archivs
+// sind für dieses Fenster ohne Wert und bleiben deshalb liegen.
+func unzipSingleFile(zipPath, memberName, targetPath string) error {
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("converter.go: unzipSingleFile (OpenReader): %w", err)
+	}
+	defer reader.Close()
+
+	for _, f := range reader.File {
+		// Im Archiv kann der Pfad einen Ordner enthalten (z.B. "bin/ab-av1.exe").
+		base := filepath.ToSlash(filepath.Base(f.Name))
+		if !strings.EqualFold(base, memberName) || f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("converter.go: unzipSingleFile (Open): %w", err)
+		}
+		defer rc.Close()
+
+		out, err := os.Create(targetPath)
+		if err != nil {
+			return fmt.Errorf("converter.go: unzipSingleFile (Create): %w", err)
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			out.Close()
+			_ = os.Remove(targetPath)
+			return fmt.Errorf("converter.go: unzipSingleFile (Copy): %w", err)
+		}
+		if err := out.Close(); err != nil {
+			_ = os.Remove(targetPath)
+			return fmt.Errorf("converter.go: unzipSingleFile (Close): %w", err)
+		}
+		return nil
+	}
+	return fmt.Errorf("converter.go: unzipSingleFile: archive has no %q", memberName)
 }
 
 // pickAsset sucht eine angehängte Datei nach ihrem Namen.
@@ -408,16 +458,16 @@ type DownloadResult struct {
 	Message  string          `json:"message"`
 }
 
-// downloadConverter lädt die neueste NVENCForge.exe in den tools-Ordner.
+// downloadConverter lädt die neueste ab-av1.exe in den tools-Ordner.
 //
-// Geschrieben wird zuerst in eine Teildatei und erst nach vollständigem
-// Download umbenannt. Sonst bliebe nach einem Abbruch eine halbe exe liegen,
-// die beim nächsten Start als vorhanden gälte.
+// ab-av1 veröffentlicht seine Windows-Binary als ZIP-Archiv. Geladen wird das
+// Archiv zuerst in eine Teildatei; erst nach vollständigem Download wird
+// daraus ab-av1.exe ausgepackt und eingesetzt. Sonst bliebe nach einem Abbruch
+// eine halbe Datei liegen, die beim nächsten Start als vorhanden gälte.
 //
 // force=false schützt vor einem Rückschritt: Kann die vorhandene Programmdatei
-// den Datenkanal und die geladene nicht, wird NICHT ersetzt. Sonst würde ein
-// Klick auf "update" die Fortschrittsanzeige stillschweigend abschalten —
-// genau das ist am 2026-08-17 passiert.
+// den 'step'-Befehl und die geladene nicht, wird NICHT ersetzt. Fortschritt
+// und Ergebnisse hängen bei ab-av1 an genau diesem Befehl.
 func downloadConverter(ctx context.Context, force bool, report func(done, total int64)) (DownloadResult, error) {
 	before := converterStatus()
 	result := DownloadResult{Status: before}
@@ -442,15 +492,24 @@ func downloadConverter(ctx context.Context, force bool, report func(done, total 
 	}
 
 	targetPath := filepath.Join(dir, converterExeName)
-	partPath := targetPath + ".part"
+	partZipPath := filepath.Join(dir, converterAssetName+".part")
+	defer os.Remove(partZipPath) // im Erfolgsfall ist sie schon weg; hier nur der Restschutz
 
-	if err := downloadToFile(ctx, asset, partPath, report); err != nil {
+	if err := downloadToFile(ctx, asset, partZipPath, report); err != nil {
 		return result, err
 	}
 
-	if !force && wouldLoseEventChannel(before, partPath) {
-		_ = os.Remove(partPath)
-		result.Message = "Release " + release.TagName + " has no event channel (-json), " +
+	// Auspacken in eine Teildatei neben dem Ziel, damit ein Fehler im Zip nie
+	// die funktionierende exe überschreibt.
+	partExePath := targetPath + ".part"
+	if err := unzipSingleFile(partZipPath, converterExeName, partExePath); err != nil {
+		return result, err
+	}
+	_ = os.Remove(partZipPath)
+
+	if !force && wouldLoseStepCommand(before, partExePath) {
+		_ = os.Remove(partExePath)
+		result.Message = "Release " + release.TagName + " has no 'step' command, " +
 			"but the converter installed here has one. Nothing was replaced — " +
 			"the progress display would have stopped working."
 		return result, nil
@@ -459,7 +518,7 @@ func downloadConverter(ctx context.Context, force bool, report func(done, total 
 	// Eine laufende alte exe kann nicht überschrieben werden; die vorher zu
 	// entfernen ist der verlässlichere Weg als sich auf Rename zu verlassen.
 	_ = os.Remove(targetPath)
-	if err := os.Rename(partPath, targetPath); err != nil {
+	if err := os.Rename(partExePath, targetPath); err != nil {
 		return result, fmt.Errorf("converter.go: downloadConverter (Rename): %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, versionFileName), []byte(release.TagName), 0o644); err != nil {
@@ -469,14 +528,14 @@ func downloadConverter(ctx context.Context, force bool, report func(done, total 
 	}
 
 	// Die frisch eingespielte Fassung einmal kurz anstoßen, damit sie ihre
-	// Konfigurationsdatei auf den eigenen Stand bringt. Ohne das passiert es
-	// erst bei der nächsten Konvertierung — und bis dahin kennt dieses Fenster
-	// neue Einstellungen nicht, kann sie also weder zeigen noch anbieten.
+	// Konfigurationsdatei (ab-av1.toml) auf den eigenen Stand bringt und —
+	// wie bisher — FFmpeg lädt, falls es fehlt. Ohne das passiert es erst bei
+	// der nächsten Konvertierung.
 	primeConverter(ctx, targetPath)
 
 	result.Replaced = true
 	result.Status = converterStatus()
-	result.Message = "NVENCForge " + release.TagName + " installed."
+	result.Message = "ab-av1 " + release.TagName + " installed."
 	return result, nil
 }
 
@@ -508,18 +567,18 @@ func primeConverter(ctx context.Context, exePath string) {
 	_ = runConverterIdle(runCtx, exePath, nil)
 }
 
-// wouldLoseEventChannel prüft, ob das Einspielen ein Rückschritt wäre.
+// wouldLoseStepCommand prüft, ob das Einspielen ein Rückschritt wäre.
 //
 // Lässt sich die geladene Datei nicht lesen, gilt sie als "kein Rückschritt" —
 // die Entscheidung darüber trifft dann die Prüfung nach dem Einspielen, und
 // die Oberfläche sagt es ohnehin an.
-func wouldLoseEventChannel(before ConverterStatus, downloadedPath string) bool {
-	if !before.Found || !before.EventChannel {
+func wouldLoseStepCommand(before ConverterStatus, downloadedPath string) bool {
+	if !before.Found || !before.HasStep {
 		return false
 	}
-	hasChannel, err := fileContainsMarker(downloadedPath, jsonFlagMarker)
+	hasStep, err := fileContainsMarker(downloadedPath, stepCommandMarker)
 	if err != nil {
 		return false
 	}
-	return !hasChannel
+	return !hasStep
 }
