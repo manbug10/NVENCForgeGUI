@@ -471,7 +471,7 @@ select:focus, input:focus { outline: 1px solid var(--accent-dim); }
     <div class="badges">
       <div class="badge"><i class="dot" id="gpu-dot"></i><span id="gpu-text">checking GPU…</span></div>
       <div class="badge">
-        <i class="dot" id="exe-dot"></i><span id="exe-text">checking NVENCForge.exe…</span>
+        <i class="dot" id="exe-dot"></i><span id="exe-text">checking ab-av1.exe…</span>
         <button class="linkish" id="btn-download" hidden>download</button>
       </div>
     </div>
@@ -1053,7 +1053,7 @@ select:focus, input:focus { outline: 1px solid var(--accent-dim); }
         </div>
         <div class="row" style="margin-top:14px">
           <button class="btn" id="btn-about-gui-repo">NVENCForgeGUI on GitHub</button>
-          <button class="btn" id="btn-about-converter-repo">NVENCForge on GitHub</button>
+          <button class="btn" id="btn-about-converter-repo">ab-av1 on GitHub</button>
           <span class="hint" id="about-note" style="margin:0"></span>
         </div>
       </section>
@@ -1105,10 +1105,10 @@ select:focus, input:focus { outline: 1px solid var(--accent-dim); }
           <li><b>Go libraries</b> — Wails and a handful of smaller ones built into the program — are under
               the MIT, BSD and Apache 2.0 licences, all compatible with the GPLv3. The README on GitHub
               names each one with its licence.</li>
-          <li><b>NVENCForge</b> is a separate program by the same author under the same licence. This
+          <li><b>ab-av1</b> is a separate program by alexheretic under GPL-3.0. This
               window looks for it in its <b>tools</b> folder and fetches it from GitHub if it is missing.</li>
-          <li><b>FFmpeg</b> (GPL build) does the actual encoding. NVENCForge fetches it itself on its
-              first run — this window never touches it.</li>
+          <li><b>FFmpeg</b> (GPL build) does the actual encoding. ab-av1 needs ffmpeg/ffprobe on its
+              path — this window downloads them into the tools folder on first run.</li>
         </ul>
       </section>
 
@@ -1300,10 +1300,13 @@ const state = {
   setupRunning: false,// the converter is writing its configuration right now
   setupTried: false,  // it was offered once this window; not again
   questions: [],      // open track questions, one per waiting converter
-  eventChannel: false,
+  eventChannel: true,   // ab-av1 always speaks JSON (--print json / progress events)
   converterFound: false,
-  cropCapable: false,  // the converter knows -crop (NVENCForge 1.21.0 and up)
-  cqCheckCapable: false, // the converter knows -cqcheck and the "cq" event (1.30.0 and up)
+  hasStep: false,       // ab-av1.exe provides the "step" command (search + convert)
+  hasConvert: false,    // ... the "convert" command (fixed encoder, no search)
+  hasSample: false,     // ... the "sample" command (measure only, no conversion)
+  cropCapable: false,   // ab-av1 can run a crop filter chain
+  cqCheckCapable: false, // reserved: ab-av1 has no separate cq-check command yet
   optionsSeeded: false, // the controls were filled from the INI once already
   forceDownload: false,  // set after a download was held back on purpose
   config: null,          // values read out of NVENCForge_Config.ini, null = not read (yet)
@@ -3375,9 +3378,15 @@ function showGPU(gpu) {
 }
 function showConverter(status) {
   state.converterFound = status.found;
-  state.eventChannel = status.eventChannel;
-  state.cropCapable = !!status.autoCrop;
-  state.cqCheckCapable = !!status.cqCheck;
+  // ab-av1 always reports progress as JSON — the event channel is a given.
+  state.eventChannel = true;
+  state.hasStep = !!status.hasStep;
+  state.hasConvert = !!status.hasConvert;
+  state.hasSample = !!status.hasSample;
+  // Crop works through the filter chain; treat it as capable when the exe
+  // exposes its step command (all official ab-av1 builds do).
+  state.cropCapable = !!status.hasStep;
+  state.cqCheckCapable = false; // ab-av1 has no separate cq-check command
   applyCropCapability();
   const dot = $("exe-dot");
   const text = $("exe-text");
@@ -3385,12 +3394,12 @@ function showConverter(status) {
 
   if (!status.found) {
     dot.className = "dot bad";
-    text.textContent = "NVENCForge.exe missing";
+    text.textContent = "ab-av1.exe missing";
     download.textContent = "get it from GitHub";
   } else {
-    dot.className = "dot " + (status.eventChannel ? "ok" : "warn");
-    text.innerHTML = "<b>NVENCForge " + status.version + "</b> · " +
-      (status.eventChannel ? "event channel" : "no event channel") +
+    dot.className = "dot ok";
+    text.innerHTML = "<b>ab-av1 " + (status.version || "?") + "</b> · " +
+      (status.hasStep ? "step / search" : "no step command") +
       (status.ffmpegPresent ? "" : " · FFmpeg is fetched on first run");
     download.textContent = "check GitHub";
   }
@@ -4419,7 +4428,7 @@ function showAbout(info) {
   $("about-gui").textContent = "NVENCForgeGUI v" + (info.guiVersion || "?");
   const converter = info.converter || {};
   $("about-converter").textContent = converter.found
-    ? "NVENCForge " + converter.version + (converter.eventChannel ? "" : " (no event channel)")
+    ? "ab-av1 " + (converter.version || "?") + (converter.hasStep ? "" : " (no step command)")
     : "not found — the Convert page offers to fetch it";
   $("about-converter-path").textContent = converter.found ? converter.path : "—";
 }

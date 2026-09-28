@@ -683,37 +683,26 @@ func (a *App) DropPendingFile(area, path string) bool {
 func (a *App) StartRun(request RunRequest) error {
 	status := converterStatus()
 	if !status.Found {
-		return errors.New("NVENCForge.exe was not found — download it first")
+		return errors.New("ab-av1.exe was not found — download it first")
 	}
 
-	// "Kästchen leer" heißt im Fenster nur "nichts dazu gesagt". Kennt die
-	// Programmdatei die Gegenschalter, wird daraus ein ausdrückliches Nein —
-	// sonst gewönne die Konfigurationsdatei gegen das, was im Fenster steht.
+	// ab-av1 kennt alle Long-Flags in beiden Richtungen (etwas setzen oder
+	// ausdrückliches Nein) stabil seit 0.7.x — eine neuere exe muss dafür nicht
+	// erst geprüft werden. Das Fenster schickt seine Einstellungen daher immer
+	// ausdrücklich; was in den Kästchen steht, gewinnt gegen ab-av1.toml.
 	//
-	// Für den Codec galt das lange NICHT: Die Datei hatte gar keinen Schlüssel,
-	// der AV1 einschaltet. Seit NVENCForge 1.23.0 gibt es codec=av1, deshalb
-	// schickt das Fenster jetzt auch dort ausdrücklich "-h265", wenn H.265
-	// ausgewählt ist.
-	if status.GuardFlags {
-		request.SuppressConverterShutdown = true
-	}
-	// Seit NVENCForge 1.23.0 stehen auch Codec, Container, Bittiefe, Ton,
-	// Auflösung und der Umgang mit dem Original in der INI. Kennt die exe die
-	// zugehörigen Gegenschalter, darf das Fenster sie mitschicken und setzt
-	// damit durch, was zu sehen ist.
-	if status.BaseSettings {
-		request.CounterFlags = true
-	}
-	if request.Crop == "" && status.AutoCrop {
-		request.Crop = cropOff
-	}
+	// Der Abschalt-Schutz (SuppressConverterShutdown) ist bei ab-av1 immer aktiv:
+	// ab-av1 besitzt selbst keinen Herunterfahr-Schalter, das Herunterfahren
+	// besorgt ausschließlich shutdown.go, wenn wirklich alles leer ist.
+	request.SuppressConverterShutdown = true
+	request.CounterFlags = status.HasStep || status.HasConvert
 
-	jobs, err := buildJobs(request, status.EventChannel)
+	jobs, err := buildJobs(request)
 	if err != nil {
 		return err
 	}
-	if !status.EventChannel {
-		a.note("This NVENCForge.exe has no event channel (-json): the progress bars stay empty, only the log fills up.")
+	if !status.HasStep {
+		a.note("This ab-av1.exe does not provide the 'step' command: quality search runs as 'convert', and progress comes from the log only.")
 	}
 
 	// Arbeitsverzeichnis ist der tools-Ordner: dort liegen die Programmdatei,

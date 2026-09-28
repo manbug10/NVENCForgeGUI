@@ -4,15 +4,12 @@
 
 // runner.go — einen Konverter-Lauf starten, mitlesen und sauber beenden.
 //
-// Der Datenkanal (-json) liefert auf dem Hauptkanal je Ereignis eine Zeile
-// JSON; die für Menschen gedachte Anzeige läuft parallel über den Fehlerkanal
-// und landet im Protokoll. Diese Trennung ist der Grund, warum am Fortschritt
-// nichts mehr geraten werden muss.
-//
-// Eine ÄLTERE Programmdatei kennt -json nicht. Dann kommt die komplette
-// Bildschirmausgabe über den Hauptkanal herein. Deshalb behandeln beide Leser
-// ihre Zeilen gleich: Was sich als Ereignis lesen lässt, ist eines — alles
-// andere ist Protokoll und wird genauso aufbereitet.
+// ab-av1 schreibt seine Fortschrittsanzeige auf den Fehlerkanal (stderr), die
+// eigentliche Ausgabe auf den Hauptkanal. Beide Leser behandeln ihre Zeilen
+// gleich: Was sich als JSON-Ereignis lesen lässt (z.B. das "Progress"-Objekt
+// von clap/indicatif), ist eines — alles andere ist Protokoll und wird
+// genauso aufbereitet. So funktioniert der Datenkanal auch, falls eine exe
+// zusätzlich strukturierte Ereignisse liefert.
 package main
 
 import (
@@ -248,6 +245,12 @@ func (r *Runner) readChannel(pipe io.Reader, mayCarryEvents bool) {
 }
 
 // parseEvent versucht, aus einer Zeile ein Ereignis zu machen.
+//
+// ab-av1 (Rust/clap) gibt als strukturierte Ereignisse JSON-Objekte mit einem
+// "type"-Feld aus — z.B. das Fortschrittsobjekt von indicatif. Frühere
+// NVENCForge-Ereignisse trugen "ev". Beide Formen werden erkannt; der Typ
+// wird in beiden Fällen unter "ev" weitergereicht, damit die Abnehmer
+// (savings.go, bookAndForward) unverändert bleiben.
 func parseEvent(raw string) (map[string]any, bool) {
 	line := strings.TrimSpace(raw)
 	if !strings.HasPrefix(line, "{") {
@@ -257,10 +260,15 @@ func parseEvent(raw string) (map[string]any, bool) {
 	if err := json.Unmarshal([]byte(line), &event); err != nil {
 		return nil, false
 	}
-	if _, ok := event["ev"]; !ok {
-		return nil, false
+	if kind, ok := event["ev"].(string); ok && kind != "" {
+		return event, true
 	}
-	return event, true
+	// ab-av1: {"type":"Progress", ...} oder {"type":"Finished", ...}
+	if kind, ok := event["type"].(string); ok && kind != "" {
+		event["ev"] = strings.ToLower(kind)
+		return event, true
+	}
+	return nil, false
 }
 
 // emitLogLine bereitet eine Zeile Bildschirmausgabe auf und schickt sie weiter.

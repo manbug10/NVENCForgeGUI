@@ -1,23 +1,2 @@
-# Build output
-build/bin
-# A stray "go build ./..." in the project root drops the exe right here.
-NVENCForgeGUI.exe
-
-# The three files the window writes for itself: the remembered size and place,
-# what was saved so far, and the profiles. They live in tools/ (ignored below);
-# the names stay listed here because an older copy may still have them lying
-# next to the exe, and because the program falls back to that spot if the
-# tools folder cannot be created.
-NVENCForgeGUI.window
-NVENCForgeGUI.savings
-NVENCForgeGUI.profiles
-
-# The bundled converter and its data. It is downloaded or built, never checked in:
-# NVENCForge.exe, ffmpeg.exe, its INI and the sources it unpacks for itself.
-tools/
-
-node_modules
-
-# Local safety copies made before edits.
-_backup/
-_backup_*/
+# Build artifacts
+dist/
